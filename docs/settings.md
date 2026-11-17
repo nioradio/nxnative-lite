@@ -288,4 +288,14 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |
 | Performance HUD | `DM_METAL_HUD` | `1`, `0` |
 
+Two knobs are not on the settings screen, because they size the app's own memory rather than change what a player sees:
+
+| Setting | Variable | Values |
+|---|---|---|
+| Texture-view ways | `DM_NVN_VC_WAYS` | `1` to `64`, default `4`, and `16` on an iPhone whose room to the memory limit is under 8 GB: the texture views kept for one texture before the oldest is rebuilt |
+| Pipeline archive budget | `DM_PSO_ARCHIVE_MAX` | bytes, such as `1500M`; unset: a quarter of the room to the memory limit on an iPhone (at most 1.5 GB), no budget on a Mac. Past it the prebuild stops and the remaining pairs are built at their first draw |
+| Game files bypass the file cache | `DM_FS_NOCACHE` | `1` (default) or `0`: `F_NOCACHE` on the RomFS image, whose files are each read once. Keeping them cached evicts the guest's own file pages, which are then read back from disk (an iPhone ends the app for `fc-thrashing`). Set `0` for a game that re-reads large files while it plays |
+
+The prebuild stops adding archive files at the budget and leaves the rest to the draws, which then take a stutter at each pair's first draw. On a phone whose room is small, that is cheaper than an archive the file cache can never hold: see [the memory notes](reference/memory.md#ios-ends-the-app-once-the-guests-touched-pages-reach-its-memory-limit).
+
 `DM_LAUNCHER=0` skips the settings screen; the choices you saved there still apply. `DM_SAVED_CHOICES=0` starts with the tested defaults and keeps your saved choices for later. How the settings are listed for each game: [dm/games/settings.tsv](../dm/games/settings.tsv).

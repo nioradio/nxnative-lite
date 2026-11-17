@@ -7062,22 +7062,47 @@ static void treg_finish_submission(void) {
 // have nothing to let it go), and goes at the first commit after the owner lets the texture go (vc_commit: the owner runs under g_smu, which cannot take g_rmu, so it lists them,
 // own_gone_take_locked), when its pool is finalized (treg_drop_pool_views), and with all the others past VC_MAX textures. Under g_rmu
 typedef struct { uint32_t pf, l0, nl, s0, ns; uint8_t tt, sw[4], pad[3]; } vc_key;
-enum { VC_WAYS = 4, VC_MAX = 16384 };
-typedef struct { const void *pool; unsigned next; vc_key k[VC_WAYS]; void *view[VC_WAYS];   // view: retained
+enum { VC_WAYS_DEFAULT = 4, VC_WAYS_MAX = 64, VC_MAX = 16384 };
+// DM_NVN_VC_WAYS: the views kept for one texture, 1 to VC_WAYS_MAX. 4 by default, as before; docs/reference/memory.md records 64 for the
+// 8 GiB iPhone runs that finished races (issue #1184), where a view rebuilt every frame is another object, another residency entry and a
+// decode. A set holds VC_WAYS_MAX either way (about 2 KB against 128 B), so a title with thousands of textures that carry views pays a few
+// MB for the room; a variable-length set would save that and add an allocation to three hot paths
+static unsigned g_vc_ways = VC_WAYS_DEFAULT;
+static pthread_once_t g_vc_ways_once = PTHREAD_ONCE_INIT;
+static void vc_ways_read(void) {
+    const char *e = getenv("DM_NVN_VC_WAYS");
+    if (e && *e) {
+        long v = strtol(e, NULL, 0);
+        if (v >= 1 && v <= VC_WAYS_MAX) g_vc_ways = (unsigned)v;
+        else MLOG("[RED] DM_NVN_VC_WAYS=%s: 1 to %d, keeping %u", e, (int)VC_WAYS_MAX, g_vc_ways);
+        return;
+    }
+#if TARGET_OS_IPHONE
+    // 4 everywhere, 16 where the room to the memory limit is small (an 8 GiB iPhone, whose room at start is about 6 GB): every way is one
+    // retained MTLTexture view per base texture and every rebuild is a new object, a new residency entry and a new decode. 16 covers a scene's
+    // repeated samplings for a few MB over the ~4,500 pools Ocarina of Time keeps; 64 ways (issue #1184's session) costs tens of MB.
+    { uint64_t room = (uint64_t)os_proc_available_memory(); if (room && room < ((uint64_t)8 << 30)) g_vc_ways = 16; }
+#endif
+}
+static void vc_ways_init(void) { pthread_once(&g_vc_ways_once, vc_ways_read); }
+typedef struct { const void *pool; unsigned next; vc_key k[VC_WAYS_MAX]; void *view[VC_WAYS_MAX];   // view: retained
                  void *rows; uint64_t rows_rid, rows_n; } vc_set;   // rows: a texture buffer as 2D rows (tbuf_as_2d; retained, resident), rows_n: its element count
 static nvn_hmap g_vc = {.klen = 8};   // the Metal texture's address → vc_set
 static uint64_t g_vc_hit, g_vc_new;
+static _Atomic int g_memwarn;   // a UIApplicationDidReceiveMemoryWarningNotification arrived (front_ios.m): vc_put frees the cached views
+// at its next call, in the same place and the same thread the capacity clear uses (g_vc.n >= VC_MAX), so no new lock order is introduced
+void mtl_vc_memwarn(void) { atomic_store(&g_memwarn, 1); }
 static inline uint64_t vc_addr(id<MTLTexture> t) { return (uint64_t)(uintptr_t)(__bridge void *)t; }
 static void vc_rows_drop(vc_set *s) { if (s->rows) { defer_obj_release((__bridge id)s->rows); CFRelease(s->rows); s->rows = NULL; s->rows_rid = s->rows_n = 0; } }
 static void vc_set_free(void *p) {
     vc_set *s = p;
-    for (int i = 0; i < VC_WAYS; i++) if (s->view[i]) { defer_obj_unref((__bridge id)s->view[i]); CFRelease(s->view[i]); }
+    for (unsigned i = 0; i < g_vc_ways; i++) if (s->view[i]) { defer_obj_unref((__bridge id)s->view[i]); CFRelease(s->view[i]); }
     vc_rows_drop(s);
     free(s);
 }
 static id<MTLTexture> vc_get(id<MTLTexture> base, const vc_key *k) {
     uint64_t a = vc_addr(base); vc_set *s = nvn_hm_get(&g_vc, &a); if (!s) return nil;
-    for (int i = 0; i < VC_WAYS; i++) if (s->view[i] && !memcmp(&s->k[i], k, sizeof *k)) { g_vc_hit++; return (__bridge id<MTLTexture>)s->view[i]; }
+    for (unsigned i = 0; i < g_vc_ways; i++) if (s->view[i] && !memcmp(&s->k[i], k, sizeof *k)) { g_vc_hit++; return (__bridge id<MTLTexture>)s->view[i]; }
     return nil;
 }
 static vc_set *vc_set_for(id<MTLTexture> base, const void *pool) {   // base's entry, made if the owner holds base
@@ -7090,9 +7115,13 @@ static vc_set *vc_set_for(id<MTLTexture> base, const void *pool) {   // base's e
     return s;
 }
 static void vc_put(id<MTLTexture> base, const void *pool, const vc_key *k, id<MTLTexture> v) {
+    vc_ways_init();
+    // The system's last word before it ends the app for memory: drop what is only a cache. The base textures, the pools and the archive's
+    // mapping stay; a view is rebuilt on the next sample that wants it.
+    if (atomic_exchange(&g_memwarn, 0)) { unsigned had = g_vc.n; nvn_hm_clear(&g_vc, vc_set_free); MLOG("[mem] memory warning: dropped the cached views of %u textures (they are rebuilt on the next sample)", had); }
     g_vc_new++;
     vc_set *s = vc_set_for(base, pool); if (!s) return;
-    unsigned i = s->next++ % VC_WAYS;
+    unsigned i = s->next++ % g_vc_ways;
     if (s->view[i]) { defer_obj_unref((__bridge id)s->view[i]); CFRelease(s->view[i]); }
     s->k[i] = *k; s->view[i] = (void *)CFBridgingRetain(v);
 }
@@ -9275,6 +9304,10 @@ static void arch_mark(int on) {
     os_unfair_lock_unlock(&g_mark_lock);
 }
 static dispatch_queue_t g_arch_q; static _Atomic int g_arch_new, g_arch_new_vd, g_arch_sched;   // bases captured and not written yet, those of them with a vertex layout
+// What the archive files hold, in all: arch_write_file adds each file as it lands, and pso_prebuild seeds it with what an earlier start left,
+// so DM_PSO_ARCHIVE_MAX bounds the files a prebuild may add (7.6 GB on an 8 GiB iPhone, 34,649 pairs, where the system's word for the kill
+// was fc-thrashing: clean file pages, out of the footprint but in the file cache)
+static _Atomic uint64_t g_arch_bytes;
 // A flush period: a compiler of its own and the serializer it captures into. A compile the archive captures joins the current period (ep_enter) and leaves it when it returns; a
 // flush (arch_flush) hands the compiles after it to a new period and writes the old period's serializer once every compile in it has returned (arch_write), and that serializer is
 // never used again. In Metal (macOS 27.0) the write (-[_MTLBinaryArchive airntSerializeToURL:options:error:]) runs on the archive's _serializeQueue and then empties it (entries,
@@ -10238,9 +10271,11 @@ static void arch_write_file(ArchEpoch *ep) {
     if (!ok && keyed) unlink(kp.fileSystemRepresentation);
     if (!ok) { MLOG("[RED] pipeline archive: writing %s failed%s%s", path.UTF8String, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); unlink(tmp.fileSystemRepresentation); if (ep->compacting) g_compact_bad = 1; }
     else {
-        MLOG("pipeline archive: %d new pipeline bases%s%s written to %s (%.1f MB, %.0f ms; compiles held back by the writes so far: %llu, %.0f ms in all)", n - cs - ms,
-             cs ? [NSString stringWithFormat:@" and %d compute pipelines", cs].UTF8String : "", ms ? [NSString stringWithFormat:@" and %d task / mesh pipelines", ms].UTF8String : "",
-             path.lastPathComponent.UTF8String, [[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6,
+        off_t fsz = (off_t)[[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize];
+        atomic_fetch_add(&g_arch_bytes, (uint64_t)fsz);
+        MLOG("pipeline archive: %d new pipeline bases%s%s written to %s (%.1f MB, %.0f ms; compiles held back by the writes so far: %llu, %.0f ms in all)",
+             n - cs - ms, cs ? [NSString stringWithFormat:@" and %d compute pipelines", cs].UTF8String : "", ms ? [NSString stringWithFormat:@" and %d task / mesh pipelines", ms].UTF8String : "",
+             path.lastPathComponent.UTF8String, fsz / 1048576.0, (bp_now() - t0) / 1e6,
              (unsigned long long)atomic_load(&g_ser_holds), atomic_load(&g_ser_held_ns) / 1e6);
     }
 }
@@ -10950,9 +10985,61 @@ static NSArray<NSNumber *> *pre_order(NSArray<NSArray<NSString *> *> *pairs) {
     return ord;
 }
 // threads: workers; wait: run on the calling thread until done (the tool), else in the background. Returns the number of pairs, -1 when there is nothing to do
+// What the archive folder holds now, for the budget: an earlier start's files count against this one's
+static uint64_t arch_bytes_on_disk(void) {
+    uint64_t t = 0;
+    for (NSString *n in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:g_arch_dir error:nil])
+        if ([n hasSuffix:@".mtl4a"]) t += (uint64_t)[[NSFileManager.defaultManager attributesOfItemAtPath:[g_arch_dir stringByAppendingPathComponent:n] error:nil] fileSize];
+    return t;
+}
+static uint64_t g_pre_budget;              // DM_PSO_ARCHIVE_MAX in bytes, or the iOS default; 0: no budget
+// The files a budget leaves no room for are unlinked, oldest first: every base in them is built again at its first draw, so what is lost is
+// only the time that takes. One already past the budget would otherwise keep its file cache for the whole session, which on an iPhone is what
+// ends the app for fc-thrashing. DM_PSO_ARCHIVE_PRUNE=0 keeps them (a build that means to keep a prebaked set should).
+static uint64_t arch_prune(uint64_t budget, uint64_t have) {
+    const char *e = getenv("DM_PSO_ARCHIVE_PRUNE"); if (e && e[0] == '0' && !e[1]) return have;
+    if (!g_arch_dir) return have;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray<NSDictionary *> *fs = [NSMutableArray array];
+    for (NSString *n in [fm contentsOfDirectoryAtPath:g_arch_dir error:nil]) if ([n hasSuffix:@".mtl4a"]) {
+        NSString *p = [g_arch_dir stringByAppendingPathComponent:n];
+        NSDictionary *a = [fm attributesOfItemAtPath:p error:nil];
+        if (a) [fs addObject:@{ @"p": p, @"s": @([a fileSize]), @"d": [a fileModificationDate] ?: NSDate.distantPast }];
+    }
+    [fs sortUsingComparator:^NSComparisonResult(NSDictionary *x, NSDictionary *y) { return [x[@"d"] compare:y[@"d"]]; }];
+    uint64_t gone = 0; int n = 0;
+    for (NSDictionary *f in fs) {
+        if (have <= budget) break;
+        if ([fm removeItemAtPath:f[@"p"] error:nil]) { have -= [f[@"s"] unsignedLongLongValue]; gone += [f[@"s"] unsignedLongLongValue]; n++; }
+    }
+    if (n) MLOG("[mem] pipeline archive: pruned %d file(s) an earlier start left (%.2f GB) to fit the budget of %.2f GB", n, gone / 1e9, budget / 1e9);
+    return have;
+}
+static _Atomic int g_pre_budget_hit, g_arch_seeded;
 static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
     shmap_load(); pso4_init();
     if (!g_comp4 || (!g_arch_bundle && !g_arch_cap) || atomic_exchange(&g_pre_running, 1)) return -1;
+    // DM_PSO_ARCHIVE_MAX: how much the archive files may hold in all, in bytes; unset, a quarter of the room to the memory limit on iOS
+    // (clamped to 256 MB .. 1.5 GB), none on the Mac. What an earlier start left is counted once, so an archive already past the budget stops
+    // the prebuild before it adds a file, and every pair is left to the draws (nvn_mtl.m, the worker loop's stop)
+    // A quarter rather than a half: the archive is file cache the guest's own files then have to be re-read from (an iPhone's fc-thrashing
+    // ends the app), and past about a gigabyte the extra bases are draws a player rarely makes. Ocarina of Time's 34,649 pairs took 7.6 GB.
+    {
+        const char *b = getenv("DM_PSO_ARCHIVE_MAX");
+        if (b && *b) g_pre_budget = strtoull(b, NULL, 0);
+#if TARGET_OS_IPHONE
+        else { uint64_t room = (uint64_t)os_proc_available_memory(); g_pre_budget = room / 4;
+               if (g_pre_budget > ((uint64_t)1536 << 20)) g_pre_budget = (uint64_t)1536 << 20;
+               if (g_pre_budget < ((uint64_t)256 << 20)) g_pre_budget = (uint64_t)256 << 20; }
+#endif
+        if (!atomic_exchange(&g_arch_seeded, 1)) {
+            uint64_t have = arch_bytes_on_disk();
+            if (g_pre_budget && have > g_pre_budget) have = arch_prune(g_pre_budget, have);
+            atomic_fetch_add(&g_arch_bytes, have);
+            if (g_pre_budget) MLOG("[mem] pipeline archive: %.2f GB on disk, budget %.2f GB (%s): the prebuild stops there and leaves the rest to the draws",
+                                   have / 1e9, g_pre_budget / 1e9, b && *b ? "DM_PSO_ARCHIVE_MAX" : "a quarter of the room to the memory limit");
+        }
+    }
     // The pairs: shader_pairs.tsv (BNSH variations and the other readers' pairs) and pso_pairs.tsv (agl BAHS program variations, also read by vs_pad; DM_PSO_PAIRS: another path),
     // both beside the shader map
     NSString *pp = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"shader_pairs.tsv"];
@@ -10997,6 +11084,15 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
             // in 996) follow one another all along the prebuild, not all at its end
             if (pre_later_take(&l, 0)) { one(l.p); continue; }
             int i = atomic_fetch_add(&g_pre_next, 1);
+            // The archive budget: the first worker past it stops the walk, and no pair is left, so the end of the prebuild (the stamp included) is
+            // the one a finished walk takes. The pairs left are the draws', a stutter each at its first draw, as with DM_PSO_PREBUILD=0
+            if (i < n && g_pre_budget && atomic_load(&g_arch_bytes) > g_pre_budget && !atomic_exchange(&g_pre_budget_hit, 1)) {
+                atomic_store(&g_pre_next, n);
+                MLOG("pipeline prebuild: stopped at the archive budget (%.2f GB on disk, budget %.2f GB) at %d of %d pairs: the rest are the draws'",
+                     atomic_load(&g_arch_bytes) / 1e9, g_pre_budget / 1e9, (int)g_pre_done, n);
+                arch_flush();
+                break;
+            }
             // the first worker to find no pair left hands the period over: it is written once the compiles still under way in it return, not after the slowest of all
             if (i >= n) { if (i == n) arch_flush(); break; }
             one(ord[(NSUInteger)i].intValue);

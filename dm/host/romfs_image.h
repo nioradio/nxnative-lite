@@ -31,6 +31,11 @@ static int romfs_image_read(int fd, void *buf, size_t size, off_t off) {
 static romfs_img *romfs_image_open(const char *path) {
     int fd = open(path, O_RDONLY); struct stat st; uint8_t h[32]; romfs_img *m = NULL; uint64_t ioff, isz, n;
     if (fd < 0) return NULL;
+    // DM_FS_NOCACHE (default on): the image's files are read once each — a texture is decoded or uploaded into guest memory and the GPU
+    // reads it from there afterwards — so keeping them in the unified buffer cache buys nothing and evicts the pages the guest's own files
+    // are backed by, which the game then has to read back from disk (on an iPhone: `fc-thrashing`, and the app is ended). Off with
+    // DM_FS_NOCACHE=0 for a game that re-reads large files while it plays (a streaming audio pack), where the cache does pay.
+    { const char *e = getenv("DM_FS_NOCACHE"); if (!(e && e[0] == '0' && !e[1])) fcntl(fd, F_NOCACHE, 1); }
     if (fstat(fd, &st) || !romfs_image_read(fd, h, sizeof h, 0)) goto bad;
     errno = EINVAL;
     if (memcmp(h, "DMROMFS1", 8) || st.st_size < (off_t)sizeof h) goto bad;

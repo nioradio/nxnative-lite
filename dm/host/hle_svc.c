@@ -189,10 +189,18 @@ static void *guest_file_thread(void *arg) {
         for (int i = 0; i < g_gf_n; i++) if (!fstat(g_gf_tab[i], &st)) held += st.st_blocks * 512.0;
         int ru_ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
-        LOG("%s[mem] guest file: %.2f GB allocated on disk, %.2f GB dirty in memory (%.0f ms to count, every 10 s), %.2f GB given back as holes; process read %.2f GB, %llu page-ins, logical writes %.2f GB; "
+        // Read amplification and the page-in rate since the last sample: the two numbers that say whether the guest's files are being read back
+        // from disk faster than the game touches new memory (a session ended for `fc-thrashing` reads 20+ GB for 7 GB of files)
+        unsigned long long pins = ru_ok ? (unsigned long long)ru.ri_pageins : 0ull;
+        double read_g = ru_ok ? ru.ri_diskio_bytesread / G : -1;
+        double amp = held > 0 && read_g >= 0 ? read_g / (held / G) : -1;   // held is in bytes, read_g in GB
+        static unsigned long long amp_pins; static long amp_sec;
+        unsigned long long pins_min = amp_sec && sec > amp_sec ? (unsigned long long)((pins - amp_pins) * 60.0 / (sec - amp_sec)) : 0;
+        amp_pins = pins; amp_sec = sec;
+        LOG("%s[mem] guest file: %.2f GB allocated on disk, %.2f GB dirty in memory (%.0f ms to count, every 10 s), %.2f GB given back as holes; process read %.2f GB (%.2fx what is allocated), %llu page-ins (%llu a minute), logical writes %.2f GB; "
             "footprint %.2f GB (internal %.2f, compressed %.2f, peak so far %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk (%.1f with what the system can purge)",
             g_gf_min_free && fs_ok && (imp > avail ? imp : avail) - need < g_gf_min_free + G ? "[RED] " : "", held / G, dirty / G, count_ms, atomic_load(&g_gf_punched) / G,
-            ru_ok ? ru.ri_diskio_bytesread / G : -1, ru_ok ? (unsigned long long)ru.ri_pageins : 0ull,
+            read_g, amp, pins, pins_min,
             ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, ru_ok ? ru.ri_lifetime_max_phys_footprint / G : -1, vi.external / G, avail / G, imp / G);
     }
     return NULL;
@@ -281,8 +289,10 @@ static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *
 }
 static void guest_file_init(void) {
     const double G = 1073741824.0; const char *e = getenv("DM_GUEST_FILE"), *d = getenv("DM_GUEST_FILE_DIR"), *mf = getenv("DM_GUEST_FILE_MIN_FREE");
+    uint64_t room = 0;   // the room to the memory limit; 0 on the Mac, which has none to read
 #if TARGET_OS_IPHONE
-    uint64_t room = os_proc_available_memory(), host = guest_host_margin(DM_GAME_APP_POOL);
+    room = os_proc_available_memory();
+    uint64_t host = guest_host_margin(DM_GAME_APP_POOL);
     int want = guest_file_wanted(e, DM_GAME_APP_POOL, host, room);
     LOG("[mem] guest memory: memory pool %.2f GB and the host's margin %.2f GB (%s), room to the memory limit %.2f GB, DM_GUEST_FILE %s: %s", DM_GAME_APP_POOL / G, host / G,
         getenv("DM_GUEST_FILE_HOST") && *getenv("DM_GUEST_FILE_HOST") ? "DM_GUEST_FILE_HOST" : "half the pool", room / G, e && *e ? e : "unset", want ? "in files" : "anonymous");
@@ -291,7 +301,11 @@ static void guest_file_init(void) {
 #endif
     if (!want) return;
     g_gf_min_free = mf && *mf ? env_size("DM_GUEST_FILE_MIN_FREE", 0, 0x100000) : (uint64_t)2 << 30;
-    size_t chunk = env_size("DM_GUEST_FILE_CHUNK", (size_t)64 << 20, 0x100000); if (!chunk) chunk = (size_t)1 << 30;
+    // 1 GB, or 512 MB where the room to the memory limit is under 8 GB: the stall at the system's periodic flush (about every 30 s) grows with
+    // the file (4 ms with 1 GB files, up to 148 ms with one 20 GB file), and 512 MB files are what the 8 GiB iPhone session in issue #1184 ran
+    // (Mario Kart World, two races, peak 4.41 GB). DM_GUEST_FILE_CHUNK still wins when it is set.
+    size_t chunk = env_size("DM_GUEST_FILE_CHUNK", (size_t)64 << 20, 0x100000);
+    if (!chunk) chunk = room && room < ((uint64_t)8 << 30) ? (size_t)512 << 20 : (size_t)1 << 30;
     if ((g_reserve + chunk - 1) / chunk > GF_MAX) chunk = ((g_reserve + GF_MAX - 1) / GF_MAX + 0xfffff) & ~(size_t)0xfffff;
     int n = (int)((g_reserve + chunk - 1) / chunk); char dir[1024] = "", why[1400]; struct statfs fs;
     if (d && *d) snprintf(dir, sizeof dir, "%s", d);

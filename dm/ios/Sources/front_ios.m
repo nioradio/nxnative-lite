@@ -320,6 +320,11 @@ static void front_ios_power_watch(void) {
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: Low Power Mode → %s (%.0f s after launch)", dm_low_power_now() ? "on" : "off", (now_ns() - g_t0_ns) / 1e9); screen_refresh(); }];
     [NSNotificationCenter.defaultCenter addObserverForName:UIScreenModeDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; screen_refresh(); }];
+    // The system's last word before it ends an app for memory. Only the texture view cache gives itself up (nvn_mtl.m, mtl_vc_memwarn): it is
+    // a cache, the views are rebuilt on the next sample, and nothing the game is drawing from is touched. The handler only sets a flag.
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        (void)n; extern void mtl_vc_memwarn(void); mtl_vc_memwarn();
+        LOG("front end: memory warning (%.0f s after launch)", (now_ns() - g_t0_ns) / 1e9); }];
     screen_refresh();
     LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s, screen %d Hz", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off", front_screen_max_fps());
 }

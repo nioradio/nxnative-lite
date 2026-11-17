@@ -99,7 +99,7 @@ def build_launcher(out, minos, clang, swiftc, sdk):   # launcher.c's main and th
         objs = [Path(t) / 'launcher.o', Path(t) / 'save_sync.o']
         for obj, src in zip(objs, (HERE / 'launcher.c', HERE.parent / 'host/save_sync.c')):
             run([clang, '-isysroot', sdk, '-arch', 'arm64', f'-mmacosx-version-min={minos}', '-O2', '-Wall', '-I', HERE.parent / 'host', '-c', '-o', obj, src])
-        run([swiftc, '-sdk', sdk, '-target', f'arm64-apple-macos{minos}', '-O', '-swift-version', '5', '-parse-as-library', '-module-cache-path', Path(t) / 'module-cache',
+        run([swiftc, '-disable-sandbox', '-sdk', sdk, '-target', f'arm64-apple-macos{minos}', '-O', '-swift-version', '5', '-parse-as-library', '-module-cache-path', Path(t) / 'module-cache',
              '-o', out, *swift_sources(), *objs, '-framework', 'CoreFoundation', '-framework', 'AppKit', '-framework', 'SwiftUI'])
 
 
@@ -451,6 +451,11 @@ def pack(a):
     clone = {k: bool(d) and can_clone(d, res) for k, d in trees.items()} | {k: bool(ps) and can_clone(ps[0], res) for k, ps in lists.items()}
     if is_chain_library(msl): clone['msl'] = False   # copy_msl writes it, which the free-space check below counts
     need = sum(tree_bytes(d) for k, d in trees.items() if d and not clone[k]) + sum(p.stat().st_size for k, ps in lists.items() if not clone[k] for p in ps)
+    if is_chain_library(msl) and not clone['msl']:
+        # copy_msl writes a subset (shader_lib.subset leaves out the Mac build's sources and the pull-request libraries), so count what it writes
+        # rather than the image it reads: on a volume with little room left the read size refuses a pack that would have fit
+        try: need += sum(rfs.Path(s).stat().st_size for s in shader_lib.app_files(msl).values()) - sum(p.stat().st_size for p in msls)
+        except OSError: pass
     if need:
         free = vol_space.free_bytes(res)
         if need + (1 << 30) > free: raise SystemExit(f'the app needs {need / 2**30:.1f} GB on the volume of {out.parent} (no APFS clones from the build there) and {free / 2**30:.1f} GB are free')
