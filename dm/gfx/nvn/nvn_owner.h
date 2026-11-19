@@ -159,6 +159,7 @@ void own_hook_parts(id o, void (^add)(id part));   // the textures an entry's ob
 int own_small_device(void);                        // the room this process started with is that of a small phone (an 8 GiB iPhone): some defaults then differ
 uint64_t own_ghost_bytes(void);                    // what the ghost table holds, in the textures' allocated size (the byte budget's figure)
 uint64_t own_ghost_budget(void);                   // the byte budget itself: DM_TEX_GHOST_MB, or the small phone's default; 0 = the entry count alone
+uint32_t own_ghost_entries(void);                  // how many entries the ghost table holds (the count rule's figure, NGHOST when idle)
 
 // ---- Queries and seams for the tests (t_serial_owner links the owner alone; the replay layer does not call these). Caller holds g_smu
 const void *own_live_ref_locked(uint64_t k);

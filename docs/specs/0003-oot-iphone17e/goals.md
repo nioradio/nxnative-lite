@@ -21,8 +21,8 @@
 - 同一份包在 Mac 上不出现该行（Mac 不受影响）
 
 **G2 · ghost 表有确定性上限**
-- `memory up to frame …: … shared textures %u (… %llu MB …)` 里那个 MB 数在同一次会话内**回落到 ≤ 384 MB**（可以是工作集之上），且不再单调上升
-- 不发生因此产生的渲染错误：`[RED] released too early` 计数为 0
+- `memory up to frame …` 行新增的 `the ghost table %u entries holding %llu MB of a %llu MB budget` 中，held 在会话内**回落到 ≤ 384 MB**（可以高于预算一次采样，之后必须下来），且不再单调上升
+- 不发生因此产生的渲染错误：`[RED] released too early` 计数为 0，`texture re-uploads` 不出现数量级暴涨
 
 **G3 · 30 分钟不被杀**
 - 一次连续会话 ≥ 30 分钟，**零 jetsam**；若仍被杀，判词中不得为 `fc-thrashing`

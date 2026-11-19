@@ -88,6 +88,7 @@ static uint64_t ghost_budget(void) {
 }
 uint64_t own_ghost_bytes(void) { return g_ghost_bytes; }
 uint64_t own_ghost_budget(void) { return ghost_budget(); }
+uint32_t own_ghost_entries(void) { return (uint32_t)g_ghost.n; }
 // The room this process started with. A phone reports it; the Mac reports 0, and is never small here, which is what keeps its defaults unchanged
 int own_small_device(void) {
     static int v = -1;

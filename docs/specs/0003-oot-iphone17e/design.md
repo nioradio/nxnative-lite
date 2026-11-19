@@ -36,6 +36,8 @@
 
 `small_device_note()` 在 `mtl_init` 建好设备后打印一次，`vc_ways_init()` 先跑，保证打印的是实际生效值。
 
+内存读数行（`memory up to frame …`）末尾追加 `the ghost table %u entries holding %llu MB of a %llu MB budget`：不加这一项，这项改动在真机上无法验证。
+
 ### 2.4 文档
 
 `docs/env_switches.tsv` 补齐这轮与上一轮新增的 6 个开关（`DM_FS_NOCACHE` / `DM_NVN_VC_WAYS` / `DM_NVN_UPLOAD_SRC_MB` / `DM_PSO_ARCHIVE_MAX` / `DM_PSO_ARCHIVE_PRUNE` / `DM_TEX_GHOST_MB`），并修正 `DM_NVN_UPLOAD_IDLE_MS` 的默认值说明。`dm/tools/env_switches.py --check` 与 `test_env_switches.py` 通过。
