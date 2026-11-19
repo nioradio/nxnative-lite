@@ -382,6 +382,14 @@ check_t_cpu_storage: RUN_ENV = MTL_DEBUG_LAYER=1
 t_initial_uncached: t_initial_uncached.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_initial_uncached.m $(MTL_T_SRC) $(FW)
 check_t_initial_uncached: RUN_ENV = MTL_DEBUG_LAYER=1
+t_upload_idle: t_upload_idle.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_idle.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_upload_idle
+check_t_upload_idle: t_upload_idle
+	env -u DM_NVN_UPLOAD_IDLE_MS DM_NVN_UPLOAD_REUSE=1 MTL_DEBUG_LAYER=1 ./t_upload_idle
+	DM_NVN_UPLOAD_IDLE_MS=0 DM_NVN_UPLOAD_REUSE=1 MTL_DEBUG_LAYER=1 ./t_upload_idle
+	DM_NVN_UPLOAD_IDLE_MS=2000 DM_NVN_UPLOAD_REUSE=1 DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_upload_idle
+	DM_NVN_UPLOAD_IDLE_MS=2000 DM_NVN_UPLOAD_REUSE=1 DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_upload_idle
 t_upload_slots: t_upload_slots.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_slots.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_upload_slots
@@ -539,7 +547,10 @@ check_t_res_cb: t_res_cb
 	@set -e; for enc in 0 1; do DM_NVN_ENC_THREAD=$$enc MTL_DEBUG_LAYER=1 ./t_res_cb; done
 t_upload_src: t_upload_src.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_src.m $(MTL_T_SRC) $(FW)
-check_t_upload_src: RUN_ENV = MTL_DEBUG_LAYER=1
+.PHONY: check_t_upload_src
+check_t_upload_src: t_upload_src
+	DM_NVN_UPLOAD_SRC_MB=0 MTL_DEBUG_LAYER=1 ./t_upload_src
+	DM_NVN_UPLOAD_SRC_MB=96 MTL_DEBUG_LAYER=1 ./t_upload_src
 t_upload_budget: t_upload_budget.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_budget.m $(MTL_T_SRC) $(FW)
 check_t_upload_budget: t_upload_budget
@@ -599,6 +610,9 @@ check_t_lazy_clear_order: RUN_ENV = MTL_DEBUG_LAYER=1
 t_zero_depth: t_zero_depth.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_zero_depth.m $(MTL_T_SRC) $(FW)
 check_t_zero_depth: RUN_ENV = MTL_DEBUG_LAYER=1
+t_zero_colour: t_zero_colour.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_zero_colour.m $(MTL_T_SRC) $(FW)
+check_t_zero_colour: RUN_ENV = MTL_DEBUG_LAYER=1
 t_clear_layers: t_clear_layers.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_clear_layers.m $(MTL_T_SRC) $(FW)
 check_t_clear_layers: RUN_ENV = MTL_DEBUG_LAYER=1

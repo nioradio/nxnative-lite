@@ -457,8 +457,8 @@ static void rh_wait(id<MTLHeap> heap) {
 - (void)dealloc { rh_wait(heap); atomic_fetch_sub(&g_image_heap_n, 1); }
 @end
 static char g_image_heap_owner_key, g_rh_owner_key;
-// A placement heap of at least `size` bytes: the smallest waiting one up to half as large again, or a new one an eighth larger (its exact size with the switch off). nil if Metal
-// makes none
+// A waiting heap can cover a nearby dynamic-resolution size. For new heaps, cap the extra space so a single large target does not keep tens of MB resident for reuse.
+enum { RH_SLACK = 4u << 20 };
 static id<MTLHeap> rh_heap(uint64_t size, MTLStorageMode sm, MTLCPUCacheMode cm, MTLHazardTrackingMode hm, int *reused) {
     *reused = 0;
     if (!size) return nil;
@@ -478,7 +478,7 @@ static id<MTLHeap> rh_heap(uint64_t size, MTLStorageMode sm, MTLCPUCacheMode cm,
         os_unfair_lock_unlock(&g_rh_lk);
     }
     if (got) { *reused = 1; atomic_fetch_add(&g_rh_reused, 1); return CFBridgingRelease(got); }
-    MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.size = on ? size + size / 8 : size;
+    MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.size = on ? size + MIN(size / 8, (uint64_t)RH_SLACK) : size;
     hd.storageMode = sm; hd.cpuCacheMode = cm; hd.hazardTrackingMode = hm;
     id<MTLHeap> h = [g_dev newHeapWithDescriptor:hd];
     if (h && on) atomic_fetch_add(&g_rh_made, 1);
@@ -1610,6 +1610,7 @@ static uint64_t g_alloc_frame, g_alloc_shared, g_alloc_shares; static int g_allo
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site);
 static void up_flush(void);
+static void up_idle_release(void);
 // The upload batch belongs only to the submit thread (the thread that called mtl_sub_begin): the batch's encoder cannot be used across threads. Every entry point asserts current thread == submit thread,
 // and on mismatch prints the stack and aborts on the spot - so that 'another thread touched the batch' is exposed deterministically on Mac too, not by timing (real iOS device stuck at the main menu: the present thread flushed the submit thread's batch via q_cb).
 static pthread_t g_sub_thread; static _Atomic int g_sub_thread_set;
@@ -1662,6 +1663,7 @@ void mtl_sub_begin(void) {
     if (g_cb) MDIE("submit re-entered");
     if (!atomic_load(&g_sub_thread_set) || !pthread_equal(g_sub_thread, pthread_self())) nvn_dirty_own_thread();
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
+    up_idle_release();
     atomic_store(&g_last_commit_error, 0);
     g_sub_pool = objc_autoreleasePoolPush();
     atomic_store(&g_sub_open, g_fence + 1); atomic_thread_fence(memory_order_seq_cst);   // before any pool lookup of this submission (pool_gone_release); only this thread moves g_fence
@@ -3319,8 +3321,88 @@ static unsigned g_up_seq;
 #define UP_SLOT_BLOCK (4u * 1024u * 1024u)
 static __strong id<MTLBuffer> g_up_slot_blk[3], g_up_slot_over[3]; static unsigned g_up_cur_slot;
 static size_t g_up_slot_want[3], g_up_batch_bytes; static int g_up_over_used;
+static size_t g_up_src_bytes;   // page-rounded bytes of the open batch's zero-copy sources
+static size_t up_src_budget(void) {
+    static size_t bytes = SIZE_MAX;
+    if (bytes == SIZE_MAX) {
+        const char *e = getenv("DM_NVN_UPLOAD_SRC_MB");
+        char *end;
+        long long mb = e ? strtoll(e, &end, 10) : 0;
+        bytes = mb > 0 && (unsigned long long)mb <= (SIZE_MAX >> 20) && !*end ? (size_t)mb << 20 : 0;
+    }
+    return bytes;
+}
 static int up_reuse(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_UPLOAD_REUSE"); on = !e || atoi(e); } return on; }
 static int up_retained(id<MTLBuffer> b, unsigned slot) { return b && (b == g_up_slot_blk[slot] || b == g_up_slot_over[slot]); }
+static size_t up_slot_block_size(size_t demand) {
+    size_t want = UP_SLOT_BLOCK;
+    while (want < demand) want <<= 1;
+    return want;
+}
+
+// Idle trimming is opt-in. An explicit 0 still reports the cache for A/B runs.
+static int g_up_idle_report;
+static uint64_t up_idle_period(void) {
+    static int64_t ns = -1;
+    if (ns < 0) {
+        const char *e = getenv("DM_NVN_UPLOAD_IDLE_MS");
+        g_up_idle_report = e && *e;
+        char *end;
+        int64_t ms = g_up_idle_report ? strtoll(e, &end, 10) : 0;
+        ns = ms > 0 && ms <= INT64_MAX / 1000000 && !*end ? ms * 1000000 : 0;
+    }
+    return (uint64_t)ns;
+}
+typedef struct {
+    uint64_t used_ns, overflow_ns, window_ns;
+    size_t peak;
+} up_idle_slot;
+static up_idle_slot g_up_idle_slot[3];
+static uint64_t g_up_idle_n, g_up_idle_bytes, g_up_blocks_new;
+
+static void up_idle_drop(__strong id<MTLBuffer> *block) {
+    if (!*block) return;
+    g_up_idle_n++;
+    g_up_idle_bytes += (*block).length;
+    res_remove(*block);
+    *block = nil;
+}
+
+static void up_idle_release(void) {
+    uint64_t idle = up_idle_period();
+    if (!g_up_idle_report || g_up_cb) return;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    uint64_t before = g_up_idle_n;
+    for (unsigned s = 0; idle && s < 3; s++) {
+        // Only the upload batch uses these blocks. Its feedback handler clears busy after GPU completion.
+        up_idle_slot *age = &g_up_idle_slot[s];
+        if (!age->used_ns || atomic_load(&g_up_alloc_busy[s])) continue;
+        if (now - age->used_ns >= idle) {
+            up_idle_drop(&g_up_slot_blk[s]);
+            up_idle_drop(&g_up_slot_over[s]);
+            g_up_slot_want[s] = 0;
+            *age = (up_idle_slot){0};
+            continue;
+        }
+        if (g_up_slot_over[s] && now - age->overflow_ns >= idle) up_idle_drop(&g_up_slot_over[s]);
+        if (now - age->window_ns >= idle) {
+            if (g_up_slot_blk[s].length > up_slot_block_size(age->peak)) up_idle_drop(&g_up_slot_blk[s]);
+            g_up_slot_want[s] = age->peak;
+            age->peak = 0;
+            age->window_ns = now;
+        }
+    }
+    // Commit the removals before this submission can allocate more GPU memory.
+    if (g_up_idle_n != before) res_commit();
+    static uint64_t said_ns;
+    if (!said_ns || now - said_ns >= 30000000000ull || (!before && g_up_idle_n)) {
+        said_ns = now;
+        size_t held = 0;
+        for (unsigned s = 0; s < 3; s++) held += g_up_slot_blk[s].length + g_up_slot_over[s].length;
+        MLOG("upload staging: slots hold %zu MiB; %llu blocks allocated, %llu trimmed (%llu MiB total)", held >> 20,
+             (unsigned long long)g_up_blocks_new, (unsigned long long)g_up_idle_n, (unsigned long long)(g_up_idle_bytes >> 20));
+    }
+}
 typedef struct {
     __unsafe_unretained id<MTLBuffer> src;
     size_t off, row, image;
@@ -3412,6 +3494,13 @@ static void up_flush(void) {
     // (nvnQueueFinish on any thread, up_begin on another) waited for that submission: hand it over now (from PR #141, which found the nvnQueueFinish half)
     if (!g_cb) rec_publish();
     if (up_reuse()) g_up_slot_want[slot] = MAX(g_up_slot_want[slot], g_up_batch_bytes);
+    if (g_up_batch_bytes && up_idle_period()) {
+        up_idle_slot *age = &g_up_idle_slot[slot];
+        age->used_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        if (g_up_over_used) age->overflow_ns = age->used_ns;
+        if (!age->window_ns) age->window_ns = age->used_ns;
+        age->peak = MAX(age->peak, g_up_batch_bytes);
+    }
     g_up_cb = nil;
     up_diag();
     g_nup_blits = 0;
@@ -3428,7 +3517,7 @@ static void up_begin(void) {
     if (atomic_load(&g_up_alloc_busy[slot])) rec_publish();
     up_wait_zero(&g_up_alloc_busy[slot], WS_UPALLOC);
     atomic_store(&g_up_alloc_busy[slot], 1); g_up_cur_slot = slot;
-    g_up_batch_bytes = 0; g_up_over_used = 0;
+    g_up_batch_bytes = g_up_src_bytes = 0; g_up_over_used = 0;
     [g_up_alloc4[slot] reset];
     g_up_cb = [g_dev newCommandBuffer];
     [g_up_cb beginCommandBufferWithAllocator:g_up_alloc4[slot]];
@@ -3441,7 +3530,7 @@ static void up_begin(void) {
 
 // Diagnostic readout (low frequency; printed only when the block switch count changed and ≥ 1 second since the last line, at most 200 lines per game): how many times an upload batch ran out of staging block and switched blocks midway; GPU allocated, residency set object count, deferred-release queue length.
 // If the old block is not retired on a switch it stays in the residency set and can never be freed, and "GPU allocated" climbs one block at a time with the switch count
-static uint64_t g_up_blocks_new, g_up_swaps, g_up_swap_bytes; static NSHashTable *g_up_old;   // g_up_old: old blocks switched out (weak references); the diagnostic line counts how many are still alive
+static uint64_t g_up_swaps, g_up_swap_bytes; static NSHashTable *g_up_old;   // g_up_old: old blocks switched out (weak references); the diagnostic line counts how many are still alive
 static void up_diag(void) { @autoreleasepool {
     // Weak-table enumeration autoreleases the buffers it finds. Do not keep
     // completed batches alive until the whole rendering submission ends.
@@ -3469,7 +3558,7 @@ static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
     if (!g_up_block && need <= UP_BLOCK_SIZE) {   // first allocation of the batch: the slot's own block, grown to the next power of two that holds it (a movie frame re-uploaded every frame, 8 MB in Link's Awakening)
         __strong id<MTLBuffer> *sb = &g_up_slot_blk[g_up_cur_slot];
         size_t demand = up_reuse() ? MAX(need, g_up_slot_want[g_up_cur_slot]) : need;
-        size_t want = UP_SLOT_BLOCK; while (want < demand) want <<= 1;
+        size_t want = up_slot_block_size(demand);
         if (*sb && (*sb).length < want) { defer_obj_release(*sb); *sb = nil; }   // the slot's previous batch has finished (up_begin waited for it)
         if (!*sb) { *sb = [g_dev newBufferWithLength:want options:MTLResourceStorageModePrivate]; if (!*sb) MDIE("failed to create the swizzled-upload staging block %#zx", want); res_add(*sb); g_up_blocks_new++; }
         g_up_block = *sb; g_up_block_size = (*sb).length; g_up_block_off = 0;
@@ -3560,7 +3649,7 @@ static void sps_note(uint64_t lo, uint64_t n) {
     if (g_nsps >= SPS_N && g_sps[i].fence > g_done && g_sps[i].fence > g_sps_lost) g_sps_lost = g_sps[i].fence;
     g_sps[i].lo = lo; g_sps[i].hi = lo + n; g_sps[i].fence = f; g_nsps++;
 }
-static id<MTLBuffer> up_big_src(uint64_t addr, uint64_t len, uint64_t *off);
+static id<MTLBuffer> up_big_src(uint64_t addr, uint64_t len, uint64_t *off, int may_split);
 // A gather reads the physical memory behind a texture once: through zero-copy buffers that the open upload batch holds and retires (up_big_src), not through the pools' own buffers, which
 // mtl_gpu_addr puts into the residency set for good, committed on the spot (pool_res). Resident Evil 4 had 148 pools and 777 MB wired that way by the forest, against 8 and 52 MB with
 // the CPU gather (issue #2350). Its pages lie scattered through the pools: a buffer per run of pages made 193,000 in 5 minutes, residency commits 2.4 s against 0.9 s while it loaded;
@@ -3572,7 +3661,7 @@ static struct { uintptr_t a, b; __unsafe_unretained id<MTLBuffer> buf; } g_sp_sr
 static int sp_src_gpu(uint64_t a, uint64_t len, uint64_t *g) {
     if (g_sp_src_seq != g_up_seq) { g_nsp_src = 0; g_sp_src_seq = g_up_seq; }
     for (int k = 0; k < g_nsp_src; k++) if (a >= g_sp_src[k].a && a + len <= g_sp_src[k].b) { *g = g_sp_src[k].buf.gpuAddress + (a - g_sp_src[k].a); return 1; }
-    uint64_t o; void *b; id<MTLBuffer> u = up_big_src(a, len, &o);
+    uint64_t o; void *b; id<MTLBuffer> u = up_big_src(a, len, &o, 0);   // every source the sparse gather's page table names must stay in this batch
     if (!u) return mtl_gpu_addr(a, len, &b, &o, g);
     if (g_nsp_src < SP_SRC_N) { g_sp_src[g_nsp_src].a = a - o; g_sp_src[g_nsp_src].b = a - o + u.length; g_sp_src[g_nsp_src++].buf = u; }
     *g = u.gpuAddress + o; return 1;
@@ -3720,16 +3809,20 @@ static void rb_swap_rows(uint8_t *p, size_t wb, size_t rows, size_t nz, size_t r
 // nil elsewhere (or if it is refused: the caller looks the address up as usual). The GPU only reads it, so it is made over the pages the upload has just protected, not through pool_buf,
 // which would make them writable again and the texture count as written at once
 static uint64_t g_up_src_made;   // source buffers made (t_upload_src)
-static id<MTLBuffer> up_big_src(uint64_t addr, uint64_t len, uint64_t *off) {
+static id<MTLBuffer> up_big_src(uint64_t addr, uint64_t len, uint64_t *off, int may_split) {
     // Not once the raw memory table holds the whole pool (big_full): the lookup finds that buffer. Ocarina of Time's first scene made 4,664 of these in one batch, 2.1 GB counted against the working set for pages already wired
     pthread_mutex_lock(&g_mu); int k = big_of(addr), in = k >= 0 && !g_big[k].full;
     if (k < 0 && len) { int i = pool_find(addr, len); in = i >= 0 && !g_pools[i].res && !addr_meets(g_pools[i].lo, g_pools[i].hi); }
     pthread_mutex_unlock(&g_mu);
     if (!in || !len) return nil;
     uintptr_t pg = (uintptr_t)getpagesize(), a = (uintptr_t)addr & ~(pg - 1), b = ((uintptr_t)addr + len + pg - 1) & ~(pg - 1);
+    // The staging budget does not count guest pages. End the batch only between textures so its completion can release those pages without invalidating a source already being assembled.
+    size_t budget = up_src_budget();
+    if (may_split && budget && g_up_src_bytes && b - a > budget - MIN(g_up_src_bytes, budget)) { up_flush(); up_begin(); }
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
     if (!buf) return nil;
     g_up_src_made++;
+    if (budget) g_up_src_bytes += b - a;
     res_add(buf); [g_up_keep addObject:buf]; *off = (uint64_t)addr - a;
     return buf;
 }
@@ -3806,7 +3899,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     void *mb; uint64_t mo;
     // A texture in a large pool (BIG_MIN) or one that holds only textures is read through a buffer of its own, held by the upload batch: a one-time read must not leave that memory wired for good
     id<MTLBuffer> upsrc = nil; unsigned src_batch = 0;   // the upload batch that holds upsrc (g_up_seq)
-    if (!linear && !rb_shift && !sparse && g_nvn_deswz_gpu) { up_begin(); src_batch = g_up_seq; upsrc = up_big_src((uint64_t)t->mem, t->L.size, &mo); if (upsrc) mb = (__bridge void *)upsrc; }
+    if (!linear && !rb_shift && !sparse && g_nvn_deswz_gpu) { up_begin(); upsrc = up_big_src((uint64_t)t->mem, t->L.size, &mo, 1); src_batch = g_up_seq; if (upsrc) mb = (__bridge void *)upsrc; }
     // A sparse pool's texture is gathered on the GPU through its page table (sp_pages_gpu), but on the CPU for DM_NVN_ZBLOCK, which counts its blocks there
     uint64_t *spt = NULL, spn = 0;
     t_tex_upload_lookup = 1;
@@ -3847,8 +3940,11 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         }
         // up_alloc may have flushed the batch that held the first source buffer: only then the new batch needs one of its own. Made for every texture, each staged upload from a large pool
         // put its storage twice into the residency set (Switch Sports Resort's first court frame: 855 textures, 1.8 GB of source buffers for 908 MB of storage; t_upload_src)
-        if (upsrc && g_up_seq != src_batch) { uint64_t mo2; id<MTLBuffer> u2 = up_big_src((uint64_t)t->mem, t->L.size, &mo2); if (u2) { upsrc = u2; mb = (__bridge void *)u2; mo = mo2; } }
-        size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits;
+        if (upsrc && g_up_seq != src_batch) {
+            upsrc = up_big_src((uint64_t)t->mem, t->L.size, &mo, 0);
+            mb = (__bridge void *)upsrc;   // if the new buffer was refused, fall back to the CPU instead of using the old batch's address
+        }
+        size_t off = 0; int enc_ok = g_up_ce != nil && mb != NULL, nb0 = g_nup_blits;
         for (unsigned l = 0; enc_ok && l < d.mipmapLevelCount; l++) {
             uint32_t w, h, z; tex_lsize(t, l, &w, &h, &z);
             size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
@@ -3868,7 +3964,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         }
         g_nup_blits = nb0;   // Roll back the copies already recorded for this texture: the already-encoded deswizzle only writes the staging area and is harmless; this texture takes the CPU path below instead
         if (!g_cb) up_flush();
-        RED_ONCE(41, "GPU deswizzle does not support format %#x target %d; falling back to the CPU", t->d.format, t->d.target);
+        if (mb) RED_ONCE(41, "GPU deswizzle does not support format %#x target %d; falling back to the CPU", t->d.format, t->d.target);
+        else RED_ONCE(40, "could not retain a texture source in the new upload batch; falling back to the CPU");
     }
 
     // A sparse pool's texture is read through a copy gathered from its page table, unmapped pages as 0 (a mip tail at a 4 KB offset has no host alias; reading the alias stopped the host with SIGBUS)
@@ -4322,11 +4419,18 @@ static void tex_zero_fill(id<MTLTexture> mt) {
     NSUInteger slices = mt.arrayLength * (tt == MTLTextureTypeCube || tt == MTLTextureTypeCubeArray ? 6 : 1);
     size_t need = (size_t)mt.width * bpp * mt.height * mt.depth;   // level 0, one slice is the largest
     if (need > (64u << 20)) { static int big; if (!big++) MLOG("new-texture zeroing: %lux%lux%lu exceeds 64 MB, not cleared", (unsigned long)mt.width, (unsigned long)mt.height, (unsigned long)mt.depth); return; }
-    id<MTLBuffer> zb = zero_buf(need); if (!zb) return;
+    // In pieces of rows, as depth above: a row is at most 256 KB (16384 x 16), so the zero buffer stays at its 4 MB. Copying a whole image grew it to the largest texture zeroed, and
+    // it stayed resident at that size for good: Ocarina of Time's was 64 MB on the iPhone 17
+    id<MTLBuffer> zb = zero_buf((size_t)mt.width * bpp); if (!zb) return;
     up_begin();
     for (NSUInteger l = 0; l < mt.mipmapLevelCount; l++) {
         NSUInteger w = MAX(mt.width >> l, 1u), h = MAX(mt.height >> l, 1u), z = tt == MTLTextureType3D ? MAX(mt.depth >> l, 1u) : 1;
-        for (NSUInteger y = 0; y < slices; y++) up_blit_add(zb, 0, w * bpp, w * bpp * h, MTLSizeMake(w, h, z), mt, y, l);
+        NSUInteger row = w * bpp, rows = MIN(h, zb.length / row);
+        NSUInteger depth = MAX((NSUInteger)1, MIN(z, zb.length / (row * h)));   // copy whole depth slices together when they fit
+        for (NSUInteger slice = 0; slice < slices; slice++) for (NSUInteger d = 0; d < z; d += depth) for (NSUInteger y = 0; y < h; y += rows) {
+            NSUInteger n = MIN(rows, h - y);
+            up_blit_add_at(zb, 0, row, row * n, MTLSizeMake(w, n, MIN(depth, z - d)), mt, slice, l, MTLOriginMake(0, y, d));
+        }
     }
     [g_up_texs addObject:mt];
     if (!g_cb) up_flush();
@@ -6284,14 +6388,16 @@ static int clear_rect_zero(int i) {
     long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
     if (x1 > lw) x1 = lw; if (y1 > lh) y1 = lh;
     if (x1 <= x0 || y1 <= y0) return 1;
-    size_t row = (size_t)(x1 - x0) * bpp, img = row * (size_t)(y1 - y0);
-    id<MTLBuffer> zb = zero_buf(img); if (!zb) return 0;
+    size_t row = (size_t)(x1 - x0) * bpp;
+    id<MTLBuffer> zb = zero_buf(row); if (!zb) return 0;   // in pieces of rows, so the zero buffer stays at its 4 MB (tex_zero_fill)
     lc_land(); rp_flush();   // waiting clears, then a pending full clear on the same attachment, must land first (oldest first), or they would overwrite this one
     // A GPU write as a pass's would be (attach): noted for the sparse and use bookkeeping, a side of a compressed-alias pair filled first and copied into its other side after, the
     // rectangle stored into storage the CPU can read (rt_mirror_flush stores a pass's)
     sparse_gpu_wrote(t); tu_wrote(mt); tex_t pair; int paired = bcp_before(t, mt, &pair);
     NVNcopyRegion rr = {(int)x0, (int)y0, 0, (int)(x1 - x0), (int)(y1 - y0), 1};
-    enc_b_copy_buffer_texture(blit(), zb, 0, row, img, MTLSizeMake((NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0), 1), mt, sl, lv, MTLOriginMake((NSUInteger)x0, (NSUInteger)y0, 0));
+    long step = MAX(1L, MIN(y1 - y0, (long)(zb.length / row)));
+    for (long y = y0; y < y1; y += step) { long n = MIN(step, y1 - y);
+        enc_b_copy_buffer_texture(blit(), zb, 0, row, row * (size_t)n, MTLSizeMake((NSUInteger)(x1 - x0), (NSUInteger)n, 1), mt, sl, lv, MTLOriginMake((NSUInteger)x0, (NSUInteger)y, 0)); }
     { id<MTLTexture> whole = mt; while (whole.parentTexture) whole = whole.parentTexture; gsb_store(t, whole, (unsigned)lv, (unsigned)sl, 1, &rr); }
     if (paired) bcp_after_to(t, &pair, (unsigned)lv, &rr);
     static uint64_t n; if (!n++) MLOG("scissored clear: first case %ldx%ld @%ld,%ld (target %lux%lu level %lu)", x1 - x0, y1 - y0, x0, y0, (unsigned long)mt.width, (unsigned long)mt.height, (unsigned long)lv);
