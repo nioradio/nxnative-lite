@@ -156,6 +156,9 @@ void own_hook_drop(id o, int keep_resident);   // an object the owner lets go: r
 uint64_t own_hook_submission(void);            // the submission being encoded (g_fence + 1): a lookup's mark, which ALIAS_IDLE and GHOST_IDLE_SUBS count from
 uint64_t own_hook_frame(void);                 // the frame being replayed (presents so far): a ghost entry's use, which GHOST_IDLE counts from
 void own_hook_parts(id o, void (^add)(id part));   // the textures an entry's object stands for besides itself (a packaged texture's), which entries may hold directly
+int own_small_device(void);                        // the room this process started with is that of a small phone (an 8 GiB iPhone): some defaults then differ
+uint64_t own_ghost_bytes(void);                    // what the ghost table holds, in the textures' allocated size (the byte budget's figure)
+uint64_t own_ghost_budget(void);                   // the byte budget itself: DM_TEX_GHOST_MB, or the small phone's default; 0 = the entry count alone
 
 // ---- Queries and seams for the tests (t_serial_owner links the owner alone; the replay layer does not call these). Caller holds g_smu
 const void *own_live_ref_locked(uint64_t k);

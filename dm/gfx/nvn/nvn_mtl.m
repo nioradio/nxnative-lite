@@ -812,6 +812,8 @@ static void udc_selftest(void) {
         MLOG("UDC self-check %s %s %lux%lu first value %08x, values differing from it %lu / %lu", g_dev.name.UTF8String, depth ? "Depth32F_S8" : "RGBA8", (unsigned long)w, (unsigned long)h, px[0], (unsigned long)bad, (unsigned long)(w * h));
     }
 }
+static void small_device_note(void);   // defined with the texture view cache: it reports that cache's ways among the defaults
+
 void mtl_init(void) {
     if (g_dev) return;
     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
@@ -824,6 +826,7 @@ void mtl_init(void) {
     if (!g_dev) MDIE("no Metal device");
     if (!g_dev.hasUnifiedMemory) MDIE("needs a unified-memory device (zero-copy memory pools)");
     g_q = [g_dev newCommandQueue];
+    small_device_note();   // one line, once: the defaults a small phone took, so a log says which profile ran
     // A device without Metal 4 (the paravirtualized GPU of a virtual Mac, such as GitHub's macos-26 runner: no residency set, no MTL4CommandQueue) cannot run the NVN layer. The GL and
     // Vulkan layers draw on classic queues of their own and need only the device (mtl_device_classic): there the classic part starts and presents are dropped, which is all a
     // run-time shader capture needs (the NSP script's capture_shaders boots headless; GitHub issue #112: Balatro's capture aborted here)
@@ -3328,7 +3331,9 @@ static size_t up_src_budget(void) {
         const char *e = getenv("DM_NVN_UPLOAD_SRC_MB");
         char *end;
         long long mb = e ? strtoll(e, &end, 10) : 0;
-        bytes = mb > 0 && (unsigned long long)mb <= (SIZE_MAX >> 20) && !*end ? (size_t)mb << 20 : 0;
+        // A small phone takes the budget by default: guest-backed sources accumulate beside staging, and there is no room to spare on an 8 GiB device
+        if (e && *e) bytes = mb > 0 && (unsigned long long)mb <= (SIZE_MAX >> 20) && !*end ? (size_t)mb << 20 : 0;
+        else bytes = own_small_device() ? (size_t)96 << 20 : 0;
     }
     return bytes;
 }
@@ -3340,7 +3345,7 @@ static size_t up_slot_block_size(size_t demand) {
     return want;
 }
 
-// Idle trimming is opt-in. An explicit 0 still reports the cache for A/B runs.
+// Idle trimming is opt-in on the Mac and on by default on a small phone, whose staging has nowhere else to go. An explicit 0 still reports the cache for A/B runs.
 static int g_up_idle_report;
 static uint64_t up_idle_period(void) {
     static int64_t ns = -1;
@@ -3348,8 +3353,10 @@ static uint64_t up_idle_period(void) {
         const char *e = getenv("DM_NVN_UPLOAD_IDLE_MS");
         g_up_idle_report = e && *e;
         char *end;
-        int64_t ms = g_up_idle_report ? strtoll(e, &end, 10) : 0;
-        ns = ms > 0 && ms <= INT64_MAX / 1000000 && !*end ? ms * 1000000 : 0;
+        int64_t ms = 0;
+        if (g_up_idle_report) ms = strtoll(e, &end, 10);
+        else if (own_small_device()) ms = 2000;   // a small phone trims completed staging once its uploads go quiet for two seconds
+        ns = ms > 0 && ms <= INT64_MAX / 1000000 && (!g_up_idle_report || !*end) ? ms * 1000000 : 0;
     }
     return (uint64_t)ns;
 }
@@ -7191,6 +7198,21 @@ static void vc_ways_read(void) {
 #endif
 }
 static void vc_ways_init(void) { pthread_once(&g_vc_ways_once, vc_ways_read); }
+// One line naming what a small phone's session takes by default, so a log says which profile ran without the switches being set by hand. Printed once, when the device is made
+static int g_profile_noted;
+static void small_device_note(void) {
+    if (g_profile_noted) return; g_profile_noted = 1;
+    if (!own_small_device()) return;
+    vc_ways_init();
+    uint64_t room = 0;
+#if TARGET_OS_IPHONE
+    room = (uint64_t)os_proc_available_memory();   // 0 on the Mac, where this note is not reached either
+#endif
+    MLOG("[mem] small device profile (room at start %llu MB): upload source budget %zu MB, completed staging trimmed after %llu ms, idle shared textures bounded at %llu MB, "
+         "texture views %u per texture. DM_NVN_UPLOAD_SRC_MB, DM_NVN_UPLOAD_IDLE_MS, DM_TEX_GHOST_MB and DM_NVN_VC_WAYS set each by hand",
+         (unsigned long long)(room >> 20), up_src_budget() >> 20, (unsigned long long)(up_idle_period() / 1000000),
+         (unsigned long long)(own_ghost_budget() >> 20), g_vc_ways);
+}
 typedef struct { const void *pool; unsigned next; vc_key k[VC_WAYS_MAX]; void *view[VC_WAYS_MAX];   // view: retained
                  void *rows; uint64_t rows_rid, rows_n; } vc_set;   // rows: a texture buffer as 2D rows (tbuf_as_2d; retained, resident), rows_n: its element count
 static nvn_hmap g_vc = {.klen = 8};   // the Metal texture's address → vc_set
@@ -11141,7 +11163,9 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
         if (b && *b) g_pre_budget = strtoull(b, NULL, 0);
 #if TARGET_OS_IPHONE
         else { uint64_t room = (uint64_t)os_proc_available_memory(); g_pre_budget = room / 4;
-               if (g_pre_budget > ((uint64_t)1536 << 20)) g_pre_budget = (uint64_t)1536 << 20;
+               // 1.5 GB, or 1 GB on a small phone: the same reasoning as the paragraph above, and past about a gigabyte the extra bases are draws a player rarely makes
+               uint64_t cap = own_small_device() ? ((uint64_t)1024 << 20) : ((uint64_t)1536 << 20);
+               if (g_pre_budget > cap) g_pre_budget = cap;
                if (g_pre_budget < ((uint64_t)256 << 20)) g_pre_budget = (uint64_t)256 << 20; }
 #endif
         if (!atomic_exchange(&g_arch_seeded, 1)) {

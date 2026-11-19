@@ -6,6 +6,7 @@
 #include "../../host/dm.h"
 #include <mach/mach.h>
 #include <os/lock.h>
+#include <os/proc.h>   // os_proc_available_memory: the room a small phone starts with decides its defaults
 
 #define ODIE(...) do { dm_log("[dm] [nvn-mtl] FATAL " __VA_ARGS__); abort(); } while (0)
 
@@ -71,6 +72,43 @@ static nvn_hmap g_ghost = {.klen = 8}; static uint64_t g_ghost_puts;
 typedef struct ghost_use { struct ghost_use *prev, *next; uint64_t serial, frame, sub; } ghost_use;   // a ghost entry's last use
 static nvn_hmap g_ghost_use = {.klen = 8};    // serial → its ghost_use: the same serials as g_ghost
 static ghost_use *g_ghost_lru, *g_ghost_mru;  // the list, least recently used first
+// What the ghost table holds, in the textures' allocated size, and the budget that bounds it. The entry count alone (NGHOST) bounds the number, not the bytes: Ocarina of Time's
+// shared textures on a phone run to several MB each, so 512 idle ones are most of a gigabyte of the GPU's memory held for records that may never replay. A budget evicts down to
+// bytes instead, by the same rule (least recently used first, and only once idle), so a working set that is used stays. DM_TEX_GHOST_MB sets it; unset, a small phone (8 GiB class,
+// the room it starts with under 8 GB) gets 384 MB, everything else the count rule alone. Under g_smu
+static uint64_t g_ghost_bytes;
+static uint64_t ghost_budget(void) {
+    static uint64_t b = UINT64_MAX;
+    if (b == UINT64_MAX) {
+        const char *e = getenv("DM_TEX_GHOST_MB");
+        if (e && *e) { char *end; long long mb = strtoll(e, &end, 10); b = mb > 0 && !*end ? (uint64_t)mb << 20 : 0; }
+        else b = own_small_device() ? (uint64_t)384 << 20 : 0;
+    }
+    return b;
+}
+uint64_t own_ghost_bytes(void) { return g_ghost_bytes; }
+uint64_t own_ghost_budget(void) { return ghost_budget(); }
+// The room this process started with. A phone reports it; the Mac reports 0, and is never small here, which is what keeps its defaults unchanged
+int own_small_device(void) {
+    static int v = -1;
+    if (v < 0) {
+#if TARGET_OS_IPHONE
+        uint64_t room = (uint64_t)os_proc_available_memory(); v = room && room < ((uint64_t)8 << 30);
+#else
+        v = 0;   // the Mac has no such limit, so nothing here is small
+#endif
+    }
+    return v;
+}
+// What a ghost entry costs: the allocated size of the texture it stands for. A packaged texture's entries hold the package, whose views share its storage, so the first part is the
+// one that takes the memory (own_hook_parts: nvn_mtl.m knows what a package holds, this file only sees an id)
+static uint64_t ghost_obj_bytes(id o) {
+    if (!o) return 0;
+    __block id<MTLTexture> t = nil;
+    own_hook_parts(o, ^(id part) { if (!t && [part conformsToProtocol:@protocol(MTLTexture)]) t = (id<MTLTexture>)part; });
+    if (!t && [o conformsToProtocol:@protocol(MTLTexture)]) t = (id<MTLTexture>)o;
+    return t ? (uint64_t)t.allocatedSize : 0;
+}
 // Deferred command descriptors and persistent bindings retain a texture serial independently of the guest descriptor and the bounded recently-finalized cache
 typedef struct { unsigned refs; void *object; } tex_pin;
 static nvn_hmap g_tex_pins = {.klen = 8}, g_tex_pin_objects = {.klen = sizeof(uintptr_t)};
@@ -333,12 +371,15 @@ static void ghost_used(uint64_t k) {   // a lookup or a put of k's ghost entry: 
 static void ghost_del_locked(uint64_t k) {   // k's ghost entry goes with its place in the list; the serial resolves anew (a note)
     ghost_use *u = nvn_hm_del(&g_ghost_use, &k); if (u) { use_unlink(u); free(u); }
     id old = hm_get_id(&g_ghost, &k); if (!old) return;
+    { uint64_t ob = ghost_obj_bytes(old); g_ghost_bytes = g_ghost_bytes > ob ? g_ghost_bytes - ob : 0; }
     ghost_held_add((__bridge void *)old, -1); obj_drop(old); hm_del_id(&g_ghost, &k); own_note(k);
 }
-// Idle entries past NGHOST go, least recently used first, at most `budget` of them; the first entry in use ends the walk (every one after it was used later)
+// Idle entries past NGHOST, or past the byte budget, go, least recently used first, at most `budget` of them; the first entry in use ends the walk (every one after it was used later).
+// Over the byte budget the walk is longer than one commit's share, so a table far above it comes down in a few commits instead of hundreds
 static void ghost_trim(unsigned budget) {
-    uint64_t frame = own_hook_frame(), sub = own_hook_submission();
-    for (; budget && g_ghost.n > NGHOST && g_ghost_lru; budget--) {
+    uint64_t frame = own_hook_frame(), sub = own_hook_submission(), cap = ghost_budget();
+    if (cap && g_ghost_bytes > cap && budget < 8 * GHOST_TRIM) budget = 8 * GHOST_TRIM;
+    for (; budget && (g_ghost.n > NGHOST || (cap && g_ghost_bytes > cap)) && g_ghost_lru; budget--) {
         const ghost_use *u = g_ghost_lru;
         if (frame - u->frame < GHOST_IDLE && sub - u->sub < GHOST_IDLE_SUBS) break;
         ghost_del_locked(u->serial);
@@ -354,6 +395,7 @@ const void *own_resolve_ref(uint64_t k) {
 static void tex_put_locked(uint64_t k, id o) {   // serials from 2^62 up are external textures (mtl_ext_tex), never initialized by the game
     nvn_hmap *m = k >= (1ull << 62) || nvn_hm_get(&g_tex_live, &k) ? &g_by_serial : &g_ghost;
     id old = hm_get_id(m, &k);
+    if (m == &g_ghost) { uint64_t ob = ghost_obj_bytes(old); g_ghost_bytes = g_ghost_bytes > ob ? g_ghost_bytes - ob : 0; g_ghost_bytes += ghost_obj_bytes(o); }
     if (old) count_add(m == &g_by_serial ? &g_by_serial_held : &g_ghost_held, (__bridge void *)old, -1);
     if (old) obj_drop(old);
     else if (m == &g_ghost) g_ghost_puts++;

@@ -55,6 +55,7 @@ DM_FS	diagnostic	When set, logs file opens, paths not found or not mounted, and 
 DM_FSLOG	diagnostic	`=<file>` writes one TSV line per ReadFile: seconds since boot, guest path, offset, length and guest buffer address
 DM_FSLOG_HASH	diagnostic	With `DM_FSLOG`, adds a column with the FNV-1a 64 hash of the bytes read
 DM_FSTEP_PROBE_RAMP	switch	`0` ends a frame-step probe's grace after its 30 frames as before; by default the grace is renewed while the probe's frames keep getting cheaper (macOS raises the GPU clock for the shorter deadline over seconds); `ab` alternates with `DM_AB`
+DM_FS_NOCACHE	switch	`1` (the default) opens the game data image with `F_NOCACHE`: its files are read once each, so the cache holds nothing useful and only evicts the guest's own file pages (the `fc-thrashing` that ended an iPhone session). `0` lets the system cache it, for a game that re-reads large files while it plays
 DM_FULLSCREEN	player	`1` (any value but `0`) starts the Mac window in fullscreen; `0` or unset, a window. The Mac settings window's Display mode
 DM_FX_DIRECT	switch	With `DM_PRESENT_UPSCALE=metalfx`, `0` keeps the present pass after MetalFX's spatial scaler; by default the scaler writes the drawable itself when the picture fills it unflipped and the drawable takes the scaler's output (iOS)
 DM_FX_INPLACE	switch	With `DM_PRESENT_UPSCALE=metalfx`, `0` keeps the copy into MetalFX's input; by default the scaler reads the presented texture itself when the picture is all of it
@@ -264,13 +265,15 @@ DM_NVN_UB_N	diagnostic	`=<frames>`: the length of each phase of the same-process
 DM_NVN_UB_PARTIAL	switch	`0`: a uniform block the deferred updates cover only in part ends the pass, as before; by default its shadow starts from memory and takes the submission's queued updates (on by default)
 DM_NVN_UNBIND_DEFER	switch	`0` makes an empty `SetRenderTargets` end the open render pass again; by default the unbind is deferred, so a following binding of the same targets continues the pass (`nvn_mtl.m` `unb_on`, on by default)
 DM_NVN_UNWRITTEN_DC	switch	`0` disables optional stores elided for loaded, unchanged attachments (on by default, independent of TBDR lookahead), for equivalence comparisons; mandatory image-write preservation stays active
-DM_NVN_UPLOAD_IDLE_MS	switch	A positive interval in milliseconds enables idle trimming of completed upload staging. Defaults to `0` on all platforms. An explicit `0` keeps the slots and logs their sizes and allocation counts for comparison.
+DM_NVN_UPLOAD_IDLE_MS	switch	A positive interval in milliseconds enables idle trimming of completed upload staging. Defaults to `0` on the Mac and on devices with room to spare, and to `2000` on a small phone (8 GiB class), where staging has nowhere else to go. An explicit `0` keeps the slots and logs their sizes and allocation counts for comparison.
 DM_NVN_UPLOAD_REUSE	switch	0 keeps the original one-block upload-slot policy; default retains bounded demand-sized primary and overflow buffers after completion.
+DM_NVN_UPLOAD_SRC_MB	switch	`=<MiB>` caps the zero-copy source buffers an upload batch holds over guest memory, flushing between textures; unset, 96 MB on a small phone (8 GiB class) and no budget elsewhere; `0` turns it off. A single texture larger than the budget, or a sparse gather, can still exceed it
 DM_NVN_VBUF_CACHE	switch	`0` turns off the cache of resolved vertex stream addresses and vertex argument table writes across draws (on by default), for A/B runs
 DM_NVN_VCONV_CHECK	diagnostic	`=1` scans the indices again at every reuse of a cached vertex conversion range (`vconv_range`) and reports differences
 DM_NVN_VCONV_CPU	switch	`=1` converts on the CPU every vertex attribute Metal's fetch cannot read, as before, instead of through the shader's shadow inputs (`<key>_bv`) or its pulling entry (`<key>_bp`)
 DM_NVN_VCONV_KEEP	switch	`=0` turns off the kept vertex conversions (`vk_get`); `=<n>` sets the smallest range kept, in vertices (default 4096, which `=1` also gives)
 DM_NVN_VCONV_RANGE	switch	`0` / `1` overrides the profile's `vconv_range`: CPU vertex conversion only over the vertices each draw reads instead of the whole bound range
+DM_NVN_VC_WAYS	switch	`=<1..64>` texture views kept per base texture (default 4, and 16 where the room to the system's memory limit is under 8 GB): every way is one retained Metal texture view, and every miss is a new object, a new residency entry and a new decode
 DM_NVN_VIS_NEED	switch	`0` counts every draw for occlusion queries once counting began, as before; by default a draw counts only while a report can see it (after a samples-passed reset or report whose next one is a reset, nothing reads it): the same values; `ab` for `DM_AB` phases
 DM_NVN_VLOG	diagnostic	Set: logs each NVN memory pool as it is created (address, memory, size, flags) with a backtrace
 DM_NVN_VSDUMP	path	Output file for post-vertex captures; used with DM_NVN_VSDUMP_KEY and the frame/count bounds
@@ -324,6 +327,8 @@ DM_PROGRAM	switch	`=<index>`: the program of a game of several programs that a h
 DM_PROGRAMS	path	Table of a game's programs on the Mac (`programs.tsv`: index, host, modules, run folder, environment): `oe::ExecuteProgram` starts the named one in this process's place; the NSP script's run command and the Mac app set it
 DM_PROGRAM_ID	switch	`=<hex>`: the program ID the host reports from `svcGetInfo(ProgramId)` (default: the profile's `program_id`)
 DM_PSO_ARCHIVE	path	The folder of the per-game Metal 4 pipeline archive of pipeline bases (default `pso_archive/` beside `pso_user.tsv`); `off` keeps no archive
+DM_PSO_ARCHIVE_MAX	switch	`=<bytes>` what the pipeline archive files may hold in all; unset, a quarter of the room to the memory limit on iOS clamped to 256 MB..1.5 GB (1 GB on a small phone) and none on the Mac. The prebuild stops there and leaves the rest of the pairs to their first draw; what an earlier start left counts, and files past the budget are unlinked at startup unless `DM_PSO_ARCHIVE_PRUNE=0`
+DM_PSO_ARCHIVE_PRUNE	switch	`0` keeps the archive files an earlier start left past `DM_PSO_ARCHIVE_MAX`; the default unlinks them, oldest first, so the budget holds from the first frame
 DM_PSO_ARCH_WARM_FLUSH_MS	switch	`=<ms>`: during a prewarm the game plays through (no prepare step) that is not compacting, the timer's flush hands the archive's period over once it is that old, then twice as long each time up to 16 times (default 60000; `0`: no flush until the prewarm ends or the period is full)
 DM_PSO_BUNDLE	path	The pipeline archive made offline (`<GPU architecture>.mtl4a`, `prebuilt.tsv`), read only; the iOS app and Mac launcher set it to their `pso/` folder; `off` ignores it
 DM_PSO_DEMAND_RECORD	switch	`0`: a pipeline a hybrid draw stands in for goes into `pso_user.tsv` only once built, not when first asked for (default: at once, so the next start's prepare step builds it)
@@ -430,6 +435,7 @@ DM_TEST_SWKBD_LAG_MS	diagnostic	`=<ms>` sleeps that long between the keyboard ha
 DM_TEST_TESS	test	Path to the native t_tess executable that test_dmsh_tess.py runs the tessellation layout and expansion kernel through on the GPU (`make check_t_tess` sets it)
 DM_TEST_TRANSFORM_FEEDBACK	test	Path to the native t_transform_feedback executable used by the Python feedback tests
 DM_TEST_UP_LOST	diagnostic	`=<batch index>` treats that batch of uploads as dropped, to exercise the re-upload path
+DM_TEX_GHOST_MB	switch	`=<MB>` bounds the ghost table (finalized textures a replayed record still resolves) by the textures' allocated size, not only by their count (512), evicting idle entries least recently used first; unset, 384 MB on a small phone (8 GiB class) and the count alone elsewhere; `0` turns the byte bound off
 DM_THERMAL_CAP	switch	`0` turns off the thermal cap, which holds the frame step at 30 fps while iOS reports a serious or critical thermal state (on by default)
 DM_THR	diagnostic	`=1` logs each SVC (except `SleepThread`) with its first four arguments, and each `CreateThread` with entry, stack, priority and core
 DM_THRCPU	diagnostic	`=<tsv path>[,<seconds>]` writes each thread's CPU time (100% = one core) and the total every interval (default 10 s); on iOS a relative path is under `Documents`, and `Documents/env.txt` can set it
